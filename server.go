@@ -1,48 +1,69 @@
+// server.go
 package main
 
 import (
-	// standard libs
 	"log"
 	"net/http"
 	"sync"
 	"time"
 
-	// third-party
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Client represents a single WebSocket connection
+/* ───── metrics ───── */
+
+var (
+	usersCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "connected_users_total",
+			Help: "Total websocket users ever connected",
+		},
+	)
+	roomsCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "rooms_total",
+			Help: "Total project rooms ever created",
+		},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(usersCounter, roomsCounter)
+}
+
+/* ───── data ───── */
+
 type Client struct {
 	conn        *websocket.Conn
 	userUUID    string
 	projectUUID string
+	mu          sync.Mutex
 }
 
-// ProjectRoom holds all clients in a project and tracks last activity
 type ProjectRoom struct {
 	clients      map[string]*Client
 	mu           sync.RWMutex
 	lastActivity time.Time
 }
 
-// Server holds all project rooms in memory
 type Server struct {
 	rooms map[string]*ProjectRoom
 	mu    sync.RWMutex
 }
 
-// NewServer initializes the server and starts cleanup goroutine
+/* ───── server helpers ───── */
+
 func NewServer() *Server {
-	s := &Server{
-		rooms: make(map[string]*ProjectRoom),
-	}
+	s := &Server{rooms: make(map[string]*ProjectRoom)}
 	go s.runCleanup()
 	return s
 }
 
-// runCleanup removes inactive project rooms every minute
 func (s *Server) runCleanup() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -61,33 +82,29 @@ func (s *Server) runCleanup() {
 	}
 }
 
-// getOrCreateRoom fetches or creates a ProjectRoom
 func (s *Server) getOrCreateRoom(pid string) *ProjectRoom {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	room, exists := s.rooms[pid]
-	if !exists {
-		room = &ProjectRoom{
-			clients:      make(map[string]*Client),
-			lastActivity: time.Now(),
-		}
+	room, ok := s.rooms[pid]
+	if !ok {
+		room = &ProjectRoom{clients: make(map[string]*Client), lastActivity: time.Now()}
 		s.rooms[pid] = room
+		roomsCounter.Inc()
 	}
 	return room
 }
 
-// AddClient registers a new client in a project room
-func (s *Server) AddClient(pid, uid string, conn *websocket.Conn) *Client {
+func (s *Server) AddClient(pid, uid string, ws *websocket.Conn) *Client {
 	room := s.getOrCreateRoom(pid)
-	client := &Client{conn: conn, userUUID: uid, projectUUID: pid}
+	client := &Client{conn: ws, userUUID: uid, projectUUID: pid}
 	room.mu.Lock()
 	room.clients[uid] = client
 	room.lastActivity = time.Now()
 	room.mu.Unlock()
+	usersCounter.Inc()
 	return client
 }
 
-// RemoveClient unregisters a client and updates activity
 func (s *Server) RemoveClient(c *Client) {
 	s.mu.RLock()
 	room, ok := s.rooms[c.projectUUID]
@@ -102,8 +119,7 @@ func (s *Server) RemoveClient(c *Client) {
 	c.conn.Close()
 }
 
-// Broadcast sends a message to all other clients in the same project
-func (s *Server) Broadcast(pid, senderUID string, msgType int, msg []byte) {
+func (s *Server) Broadcast(pid, sender string, mt int, msg []byte) {
 	s.mu.RLock()
 	room, ok := s.rooms[pid]
 	s.mu.RUnlock()
@@ -111,37 +127,65 @@ func (s *Server) Broadcast(pid, senderUID string, msgType int, msg []byte) {
 		return
 	}
 	room.mu.RLock()
-	defer room.mu.RUnlock()
-	for uid, client := range room.clients {
-		if uid == senderUID {
-			continue
+	targets := make([]*Client, 0, len(room.clients))
+	for uid, c := range room.clients {
+		if uid != sender {
+			targets = append(targets, c)
 		}
-		if err := client.conn.WriteMessage(msgType, msg); err != nil {
-			// ignore write errors
-			continue
-		}
+	}
+	room.mu.RUnlock()
+	for _, c := range targets {
+		c.mu.Lock()
+		_ = c.conn.WriteMessage(mt, msg)
+		c.mu.Unlock()
 	}
 	room.mu.Lock()
 	room.lastActivity = time.Now()
 	room.mu.Unlock()
 }
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // adjust in prod
-	},
+func (s *Server) UsersCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	total := 0
+	for _, room := range s.rooms {
+		room.mu.RLock()
+		total += len(room.clients)
+		room.mu.RUnlock()
+	}
+	return total
 }
+
+func (s *Server) RoomsCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.rooms)
+}
+
+/* ───── main ───── */
+
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 func main() {
 	e := echo.New()
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
+
 	server := NewServer()
 
-	e.GET("/", func(c echo.Context) error {
-		return c.JSON(http.StatusOK, map[string]string{"message": "ok"})
+	/* status endpoint */
+	e.GET("/status", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, echo.Map{
+			"status":      "ok",
+			"users_count": server.UsersCount(),
+			"rooms_count": server.RoomsCount(),
+		})
 	})
 
+	/* prometheus metrics */
+	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
+
+	/* websocket */
 	e.GET("/ws", func(c echo.Context) error {
 		uid := c.QueryParam("user_uuid")
 		pid := c.QueryParam("project_uuid")
@@ -154,17 +198,18 @@ func main() {
 		}
 		client := server.AddClient(pid, uid, ws)
 		defer server.RemoveClient(client)
-
 		for {
-			msgType, msg, err := ws.ReadMessage()
+			mt, msg, err := ws.ReadMessage()
 			if err != nil {
 				break
 			}
-			// broadcast raw message to other users in same project
-			server.Broadcast(pid, uid, msgType, msg)
+			server.Broadcast(pid, uid, mt, msg)
 		}
 		return nil
 	})
+
+	/* serve react build */
+	e.Static("/", "www/dist")
 
 	log.Fatal(e.Start(":8989"))
 }

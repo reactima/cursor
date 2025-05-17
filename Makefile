@@ -10,12 +10,13 @@ push: ##  git push into productio
 	-git push origin main
 	git push cursor main
 	echo "https://github.com/reactima/cursor"
-	echo "https://gisowl.com/"
+	echo "https://cursor.reactima.com/"
 
 save: ## save
 	git add .
 	git commit -m "auto front"
 	git push cursor main
 	echo "https://github.com/reactima/cursor"
+	echo "https://cursor.reactima.com/"
 
 .DEFAULT_GOAL := help
