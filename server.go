@@ -138,6 +138,10 @@ func main() {
 	e.Use(middleware.Recover())
 	server := NewServer()
 
+	e.GET("/", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{"message": "ok"})
+	})
+
 	e.GET("/ws", func(c echo.Context) error {
 		uid := c.QueryParam("user_uuid")
 		pid := c.QueryParam("project_uuid")
