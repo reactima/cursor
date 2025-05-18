@@ -31,7 +31,7 @@ export default defineConfig({
           entry: 'src/index.tsx',
           injectOptions: {
             data: {
-              title: 'example.com',
+              title: 'cursor',
             },
             // Add tags or ejsOptions if necessary
           },

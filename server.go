@@ -15,8 +15,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-/* ───── metrics ───── */
-
 var (
 	usersCounter = prometheus.NewCounter(
 		prometheus.CounterOpts{
@@ -36,8 +34,6 @@ func init() {
 	prometheus.MustRegister(usersCounter, roomsCounter)
 }
 
-/* ───── data ───── */
-
 type Client struct {
 	conn        *websocket.Conn
 	userUUID    string
@@ -55,8 +51,6 @@ type Server struct {
 	rooms map[string]*ProjectRoom
 	mu    sync.RWMutex
 }
-
-/* ───── server helpers ───── */
 
 func NewServer() *Server {
 	s := &Server{rooms: make(map[string]*ProjectRoom)}
@@ -162,8 +156,6 @@ func (s *Server) RoomsCount() int {
 	return len(s.rooms)
 }
 
-/* ───── main ───── */
-
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 func main() {
@@ -182,10 +174,8 @@ func main() {
 		})
 	})
 
-	/* prometheus metrics */
 	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 
-	/* websocket */
 	e.GET("/ws", func(c echo.Context) error {
 		uid := c.QueryParam("user_uuid")
 		pid := c.QueryParam("project_uuid")
@@ -208,7 +198,6 @@ func main() {
 		return nil
 	})
 
-	/* serve react build */
 	e.Static("/", "www/dist")
 
 	log.Fatal(e.Start(":8989"))
