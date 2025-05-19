@@ -2,11 +2,15 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
@@ -16,6 +20,7 @@ import (
 )
 
 var (
+	// Prometheus metrics
 	usersCounter = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "connected_users_total",
@@ -28,6 +33,9 @@ var (
 			Help: "Total project rooms ever created",
 		},
 	)
+
+	// Supabase JWT secret from environment
+	supabaseJWTSecret = os.Getenv("SUPABASE_JWT_SECRET")
 )
 
 func init() {
@@ -158,6 +166,29 @@ func (s *Server) RoomsCount() int {
 
 var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
+// verifySupabaseToken parses and validates a Supabase JWT, returning the user UUID
+func verifySupabaseToken(tokenString string) (string, error) {
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		// Ensure token method is HMAC
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return []byte(supabaseJWTSecret), nil
+	})
+	if err != nil || !token.Valid {
+		return "", fmt.Errorf("invalid token: %w", err)
+	}
+	claims, ok := token.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", fmt.Errorf("invalid token claims")
+	}
+	sub, ok := claims["sub"].(string)
+	if !ok {
+		return "", fmt.Errorf("subject claim missing or invalid")
+	}
+	return sub, nil
+}
+
 func main() {
 	e := echo.New()
 	e.Use(middleware.Logger())
@@ -165,7 +196,7 @@ func main() {
 
 	server := NewServer()
 
-	/* status endpoint */
+	// health/status endpoint
 	e.GET("/status", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, echo.Map{
 			"status":      "ok",
@@ -176,16 +207,39 @@ func main() {
 
 	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 
+	// WebSocket endpoint with Supabase JWT check
 	e.GET("/ws", func(c echo.Context) error {
 		uid := c.QueryParam("user_uuid")
 		pid := c.QueryParam("project_uuid")
 		if uid == "" || pid == "" {
 			return echo.NewHTTPError(http.StatusBadRequest, "user_uuid and project_uuid required")
 		}
+
+		// Extract Bearer token
+		authHeader := c.Request().Header.Get("Authorization")
+		if authHeader == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "Authorization header required")
+		}
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+			return echo.NewHTTPError(http.StatusBadRequest, "Authorization format must be Bearer {token}")
+		}
+		tokenString := parts[1]
+
+		// Verify JWT and match UUID
+		validatedUUID, err := verifySupabaseToken(tokenString)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
+		}
+		if validatedUUID != uid {
+			return echo.NewHTTPError(http.StatusUnauthorized, "token user mismatch")
+		}
+
 		ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
 		if err != nil {
 			return err
 		}
+
 		client := server.AddClient(pid, uid, ws)
 		defer server.RemoveClient(client)
 		for {

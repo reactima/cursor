@@ -3,6 +3,7 @@ module github.com/reactima/cursor
 go 1.24.1
 
 require (
+	github.com/golang-jwt/jwt/v4 v4.5.2
 	github.com/gorilla/websocket v1.5.3
 	github.com/labstack/echo/v4 v4.13.3
 	github.com/prometheus/client_golang v1.22.0
