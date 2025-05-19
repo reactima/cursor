@@ -146,16 +146,15 @@ func (s *Server) Broadcast(pid, sender string, mt int, msg []byte) {
 	room.mu.Unlock()
 }
 
-func (s *Server) UsersCount() int {
+func (s *Server) UsersCount() (total int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	total := 0
 	for _, room := range s.rooms {
 		room.mu.RLock()
 		total += len(room.clients)
 		room.mu.RUnlock()
 	}
-	return total
+	return
 }
 
 func (s *Server) RoomsCount() int {
@@ -189,6 +188,11 @@ func verifySupabaseToken(tokenString string) (string, error) {
 	return sub, nil
 }
 
+/* -------------------------------------------------------------------------
+ * main
+ * -----------------------------------------------------------------------*/
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+
 func main() {
 	e := echo.New()
 	e.Use(middleware.Logger())
@@ -215,11 +219,24 @@ func main() {
 			return echo.NewHTTPError(http.StatusBadRequest, "user_uuid and project_uuid required")
 		}
 
-		// Extract Bearer token
+		/* 1️⃣ Try normal Authorization header (CLI / Node clients) */
 		authHeader := c.Request().Header.Get("Authorization")
+
+		/* 2️⃣ Fallback: extract JWT from Sec-WebSocket-Protocol
+		   Browser sends:  "Bearer, <token>"
+		*/
 		if authHeader == "" {
-			return echo.NewHTTPError(http.StatusBadRequest, "Authorization header required")
+			if protoHdr := c.Request().Header.Get("Sec-WebSocket-Protocol"); protoHdr != "" {
+				parts := strings.Split(protoHdr, ",")
+				if len(parts) == 2 && strings.TrimSpace(parts[0]) == "Bearer" {
+					authHeader = "Bearer " + strings.TrimSpace(parts[1])
+				}
+			}
 		}
+		if authHeader == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "Authorization required (header or sub-protocol)")
+		}
+
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
 			return echo.NewHTTPError(http.StatusBadRequest, "Authorization format must be Bearer {token}")
