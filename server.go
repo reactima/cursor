@@ -163,8 +163,6 @@ func (s *Server) RoomsCount() int {
 	return len(s.rooms)
 }
 
-var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
-
 // verifySupabaseToken parses and validates a Supabase JWT, returning the user UUID
 func verifySupabaseToken(tokenString string) (string, error) {
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
