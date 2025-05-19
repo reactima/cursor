@@ -201,7 +201,12 @@ func verifySupabaseToken(tokenString string) (string, error) {
 	return sub, nil
 }
 
-var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+// here’s the only bit that changed: we now accept "Bearer" as a valid sub-protocol so
+// the browser sees it echoed back and keeps the connection open.
+var upgrader = websocket.Upgrader{
+	CheckOrigin:  func(r *http.Request) bool { return true },
+	Subprotocols: []string{"Bearer"},
+}
 
 func main() {
 	e := echo.New()
