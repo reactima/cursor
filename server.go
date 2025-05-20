@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MicahParks/keyfunc"
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
@@ -31,19 +32,43 @@ var (
 		},
 	)
 
-	supabaseJWTSecret = os.Getenv("SUPABASE_JWT_SECRET")
+	// Supabase configuration from environment
+	supabaseURL        = os.Getenv("SUPABASE_URL")
+	supabaseAnonKey    = os.Getenv("SUPABASE_ANON_KEY")
+	supabaseServiceKey = os.Getenv("SUPABASE_SERVICE_KEY")
+
+	// jwks holds the JSON Web Key Set for verifying Supabase JWTs
+	jwks *keyfunc.JWKS
 )
 
 func init() {
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{AddSource: true})
-	if supabaseJWTSecret == "" {
-		slog.Error("SUPABASE_JWT_SECRET is not set")
-	} else {
-		slog.Info("SUPABASE_JWT_SECRET is set")
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{AddSource: false})
+
+	if supabaseURL == "" {
+		slog.Error("SUPABASE_URL is not set")
 	}
+	if supabaseAnonKey == "" {
+		slog.Error("SUPABASE_ANON_KEY is not set")
+	}
+	if supabaseServiceKey == "" {
+		slog.Error("SUPABASE_SERVICE_KEY is not set")
+	}
+	slog.Info("Supabase env vars loaded", "url", supabaseURL)
 
 	slog.SetDefault(slog.New(handler))
 	prometheus.MustRegister(usersCounter, roomsCounter)
+
+	// Initialize JWKS from Supabase
+	jwksURL := fmt.Sprintf("%s/auth/v1/.well-known/jwks.json", supabaseURL)
+	var err error
+	jwks, err = keyfunc.Get(jwksURL, keyfunc.Options{
+		RefreshInterval:    time.Hour, // refresh JWKs every hour
+		RefreshErrorLogger: slog.New(func(r slog.Record) error { r.Log(); return nil }, nil),
+	})
+	if err != nil {
+		slog.Error("failed to get JWKS", "url", jwksURL, "error", err.Error())
+		os.Exit(1)
+	}
 }
 
 type Client struct {
@@ -156,7 +181,8 @@ func (s *Server) Broadcast(pid, sender string, mt int, msg []byte) {
 	room.mu.Unlock()
 }
 
-func (s *Server) UsersCount() (total int) {
+func (s *Server) UsersCount() int {
+	total := 0
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, room := range s.rooms {
@@ -164,7 +190,7 @@ func (s *Server) UsersCount() (total int) {
 		total += len(room.clients)
 		room.mu.RUnlock()
 	}
-	return
+	return total
 }
 
 func (s *Server) RoomsCount() int {
@@ -174,14 +200,10 @@ func (s *Server) RoomsCount() int {
 }
 
 func verifySupabaseToken(tokenString string) (string, error) {
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
-		return []byte(supabaseJWTSecret), nil
-	})
+	// Parse and verify the token using the JWKS
+	token, err := jwt.Parse(tokenString, jwks.Keyfunc)
 	if err != nil {
-		slog.Error("token parse error", "error", err.Error())
+		slog.Error("token parse/verify error", "error", err.Error())
 		return "", fmt.Errorf("invalid token: %w", err)
 	}
 	if !token.Valid {
@@ -201,11 +223,9 @@ func verifySupabaseToken(tokenString string) (string, error) {
 	return sub, nil
 }
 
-// here’s the only bit that changed: we now accept "Bearer" as a valid sub-protocol so
-// the browser sees it echoed back and keeps the connection open.
 var upgrader = websocket.Upgrader{
 	CheckOrigin:  func(r *http.Request) bool { return true },
-	Subprotocols: []string{"Bearer"},
+	Subprotocols: []string{"Bearer"}, // echo back to client
 }
 
 func main() {
@@ -232,6 +252,7 @@ func main() {
 			slog.Error("missing query params", "user_uuid", uid, "project_uuid", pid)
 			return echo.NewHTTPError(http.StatusBadRequest, "user_uuid and project_uuid required")
 		}
+
 		authHeader := c.Request().Header.Get("Authorization")
 		if authHeader == "" {
 			if protoHdr := c.Request().Header.Get("Sec-WebSocket-Protocol"); protoHdr != "" {
@@ -245,17 +266,17 @@ func main() {
 			slog.Error("authorization missing")
 			return echo.NewHTTPError(http.StatusBadRequest, "Authorization required (header or sub-protocol)")
 		}
+
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
 			slog.Error("invalid authorization format", "header", authHeader)
 			return echo.NewHTTPError(http.StatusBadRequest, "Authorization format must be Bearer {token}")
 		}
-		tokenString := parts[1]
 
+		tokenString := parts[1]
 		validatedUUID, err := verifySupabaseToken(tokenString)
 		if err != nil {
-			slog.Error("invalid authorization format", "tokenString", tokenString, "supabaseJWTSecret", supabaseJWTSecret, "error", err.Error())
-
+			slog.Error("token verification failed", "error", err.Error())
 			return echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
 		}
 		if validatedUUID != uid {
@@ -271,6 +292,7 @@ func main() {
 
 		client := server.AddClient(pid, uid, ws)
 		defer server.RemoveClient(client)
+
 		for {
 			mt, msg, err := ws.ReadMessage()
 			if err != nil {
