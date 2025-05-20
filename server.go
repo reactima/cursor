@@ -29,44 +29,36 @@ var (
 		Help: "Total project rooms ever created",
 	})
 
-	// Supabase configuration
-	supabaseURL        = strings.TrimRight(os.Getenv("SUPABASE_URL"), "/")
-	supabaseServiceKey = os.Getenv("SUPABASE_SERVICE_KEY")
+	// Only SUPABASE_URL is needed to fetch the public JWKS
+	supabaseURL = strings.TrimRight(os.Getenv("SUPABASE_URL"), "/")
 
-	// JWKS for verifying JWTs
 	jwks *keyfunc.JWKS
 )
 
 func init() {
-	// structured JSON logging
+	// JSON structured logging
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{AddSource: false})))
 
-	// require necessary env vars
+	// require SUPABASE_URL
 	if supabaseURL == "" {
 		slog.Error("SUPABASE_URL is not set")
 		os.Exit(1)
 	}
-	if supabaseServiceKey == "" {
-		slog.Error("SUPABASE_SERVICE_KEY is not set")
-		os.Exit(1)
-	}
 	slog.Info("Supabase env loaded", "url", supabaseURL)
 
-	// fetch JWKS so we can verify tokens
+	// fetch public JWKS (no auth required) from the well-known endpoint
 	jwksURL := fmt.Sprintf("%s/auth/v1/.well-known/jwks.json", supabaseURL)
 	var err error
 	jwks, err = keyfunc.Get(jwksURL, keyfunc.Options{
-		RefreshInterval: time.Hour,
-		RefreshErrorHandler: func(err error) {
-			slog.Error("JWKS refresh error", "error", err.Error())
-		},
+		RefreshInterval:     time.Hour,
+		RefreshErrorHandler: func(err error) { slog.Error("JWKS refresh error", "error", err.Error()) },
 	})
 	if err != nil {
 		slog.Error("failed to fetch JWKS", "url", jwksURL, "error", err.Error())
 		os.Exit(1)
 	}
 
-	// register metrics
+	// register Prometheus metrics
 	prometheus.MustRegister(usersCounter, roomsCounter)
 }
 
