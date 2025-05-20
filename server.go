@@ -19,58 +19,58 @@ import (
 )
 
 var (
-	usersCounter = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "connected_users_total",
-			Help: "Total websocket users ever connected",
-		},
-	)
-	roomsCounter = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "rooms_total",
-			Help: "Total project rooms ever created",
-		},
-	)
+	// Prometheus metrics
+	usersCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "connected_users_total",
+		Help: "Total websocket users ever connected",
+	})
+	roomsCounter = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "rooms_total",
+		Help: "Total project rooms ever created",
+	})
 
-	// Supabase configuration from environment
-	supabaseURL        = os.Getenv("SUPABASE_URL")
-	supabaseAnonKey    = os.Getenv("SUPABASE_ANON_KEY")
+	// Supabase configuration
+	supabaseURL        = strings.TrimRight(os.Getenv("SUPABASE_URL"), "/")
 	supabaseServiceKey = os.Getenv("SUPABASE_SERVICE_KEY")
 
-	// jwks holds the JSON Web Key Set for verifying Supabase JWTs
+	// JWKS for verifying JWTs
 	jwks *keyfunc.JWKS
 )
 
 func init() {
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{AddSource: false})
+	// structured JSON logging
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{AddSource: false})))
 
+	// require necessary env vars
 	if supabaseURL == "" {
 		slog.Error("SUPABASE_URL is not set")
-	}
-	if supabaseAnonKey == "" {
-		slog.Error("SUPABASE_ANON_KEY is not set")
+		os.Exit(1)
 	}
 	if supabaseServiceKey == "" {
 		slog.Error("SUPABASE_SERVICE_KEY is not set")
+		os.Exit(1)
 	}
-	slog.Info("Supabase env vars loaded", "url", supabaseURL)
+	slog.Info("Supabase env loaded", "url", supabaseURL)
 
-	slog.SetDefault(slog.New(handler))
-	prometheus.MustRegister(usersCounter, roomsCounter)
-
-	// Initialize JWKS from Supabase
+	// fetch JWKS so we can verify tokens
 	jwksURL := fmt.Sprintf("%s/auth/v1/.well-known/jwks.json", supabaseURL)
 	var err error
 	jwks, err = keyfunc.Get(jwksURL, keyfunc.Options{
-		RefreshInterval:    time.Hour, // refresh JWKs every hour
-		RefreshErrorLogger: slog.New(func(r slog.Record) error { r.Log(); return nil }, nil),
+		RefreshInterval: time.Hour,
+		RefreshErrorHandler: func(err error) {
+			slog.Error("JWKS refresh error", "error", err.Error())
+		},
 	})
 	if err != nil {
-		slog.Error("failed to get JWKS", "url", jwksURL, "error", err.Error())
+		slog.Error("failed to fetch JWKS", "url", jwksURL, "error", err.Error())
 		os.Exit(1)
 	}
+
+	// register metrics
+	prometheus.MustRegister(usersCounter, roomsCounter)
 }
 
+// Client represents a single websocket connection
 type Client struct {
 	conn        *websocket.Conn
 	userUUID    string
@@ -78,24 +78,28 @@ type Client struct {
 	mu          sync.Mutex
 }
 
+// ProjectRoom holds clients and last activity timestamp
 type ProjectRoom struct {
 	clients      map[string]*Client
 	mu           sync.RWMutex
 	lastActivity time.Time
 }
 
+// Server manages all project rooms
 type Server struct {
 	rooms map[string]*ProjectRoom
 	mu    sync.RWMutex
 }
 
+// NewServer creates a Server and starts idle-room cleanup
 func NewServer() *Server {
 	s := &Server{rooms: make(map[string]*ProjectRoom)}
-	go s.runCleanup()
+	go s.cleanupLoop()
 	return s
 }
 
-func (s *Server) runCleanup() {
+// cleanupLoop removes rooms idle for 15m every minute
+func (s *Server) cleanupLoop() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -103,42 +107,49 @@ func (s *Server) runCleanup() {
 		s.mu.Lock()
 		for pid, room := range s.rooms {
 			room.mu.RLock()
-			last := room.lastActivity
-			room.mu.RUnlock()
-			if last.Before(cutoff) {
+			if room.lastActivity.Before(cutoff) {
 				delete(s.rooms, pid)
 				slog.Info("cleaned up room", "project", pid)
 			}
+			room.mu.RUnlock()
 		}
 		s.mu.Unlock()
 	}
 }
 
+// getOrCreateRoom fetches or makes a room
 func (s *Server) getOrCreateRoom(pid string) *ProjectRoom {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	room, ok := s.rooms[pid]
-	if !ok {
-		room = &ProjectRoom{clients: make(map[string]*Client), lastActivity: time.Now()}
-		s.rooms[pid] = room
-		roomsCounter.Inc()
-		slog.Info("created new room", "project", pid)
+	if room, ok := s.rooms[pid]; ok {
+		return room
 	}
+	room := &ProjectRoom{
+		clients:      make(map[string]*Client),
+		lastActivity: time.Now(),
+	}
+	s.rooms[pid] = room
+	roomsCounter.Inc()
+	slog.Info("created room", "project", pid)
 	return room
 }
 
+// AddClient registers a websocket client in a room
 func (s *Server) AddClient(pid, uid string, ws *websocket.Conn) *Client {
 	room := s.getOrCreateRoom(pid)
 	client := &Client{conn: ws, userUUID: uid, projectUUID: pid}
+
 	room.mu.Lock()
 	room.clients[uid] = client
 	room.lastActivity = time.Now()
 	room.mu.Unlock()
+
 	usersCounter.Inc()
 	slog.Info("added client", "user", uid, "project", pid)
 	return client
 }
 
+// RemoveClient unregisters and closes a websocket client
 func (s *Server) RemoveClient(c *Client) {
 	s.mu.RLock()
 	room, ok := s.rooms[c.projectUUID]
@@ -154,6 +165,7 @@ func (s *Server) RemoveClient(c *Client) {
 	slog.Info("removed client", "user", c.userUUID, "project", c.projectUUID)
 }
 
+// Broadcast sends a message to all other clients in the room
 func (s *Server) Broadcast(pid, sender string, mt int, msg []byte) {
 	s.mu.RLock()
 	room, ok := s.rooms[pid]
@@ -163,24 +175,25 @@ func (s *Server) Broadcast(pid, sender string, mt int, msg []byte) {
 	}
 	room.mu.RLock()
 	targets := make([]*Client, 0, len(room.clients))
-	for uid, c := range room.clients {
+	for uid, cl := range room.clients {
 		if uid != sender {
-			targets = append(targets, c)
+			targets = append(targets, cl)
 		}
 	}
 	room.mu.RUnlock()
-	for _, c := range targets {
-		c.mu.Lock()
-		if err := c.conn.WriteMessage(mt, msg); err != nil {
-			slog.Error("write message failed", "error", err.Error(), "user", c.userUUID, "project", pid)
+	for _, cl := range targets {
+		cl.mu.Lock()
+		if err := cl.conn.WriteMessage(mt, msg); err != nil {
+			slog.Error("write failed", "error", err.Error(), "user", cl.userUUID, "project", pid)
 		}
-		c.mu.Unlock()
+		cl.mu.Unlock()
 	}
 	room.mu.Lock()
 	room.lastActivity = time.Now()
 	room.mu.Unlock()
 }
 
+// UsersCount returns total websocket clients
 func (s *Server) UsersCount() int {
 	total := 0
 	s.mu.RLock()
@@ -193,39 +206,37 @@ func (s *Server) UsersCount() int {
 	return total
 }
 
+// RoomsCount returns number of active rooms
 func (s *Server) RoomsCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.rooms)
 }
 
+// verifySupabaseToken parses and validates a JWT via JWKS
 func verifySupabaseToken(tokenString string) (string, error) {
-	// Parse and verify the token using the JWKS
 	token, err := jwt.Parse(tokenString, jwks.Keyfunc)
 	if err != nil {
-		slog.Error("token parse/verify error", "error", err.Error())
 		return "", fmt.Errorf("invalid token: %w", err)
 	}
 	if !token.Valid {
-		slog.Error("invalid token", "token", tokenString)
 		return "", fmt.Errorf("invalid token")
 	}
 	claims, ok := token.Claims.(jwt.MapClaims)
 	if !ok {
-		slog.Error("invalid token claims")
-		return "", fmt.Errorf("invalid token claims")
+		return "", fmt.Errorf("invalid claims")
 	}
 	sub, ok := claims["sub"].(string)
 	if !ok {
-		slog.Error("subject claim missing or invalid")
-		return "", fmt.Errorf("subject claim missing or invalid")
+		return "", fmt.Errorf("subject claim missing")
 	}
 	return sub, nil
 }
 
+// upgrader echoes "Bearer" so client retains the token
 var upgrader = websocket.Upgrader{
 	CheckOrigin:  func(r *http.Request) bool { return true },
-	Subprotocols: []string{"Bearer"}, // echo back to client
+	Subprotocols: []string{"Bearer"},
 }
 
 func main() {
@@ -235,6 +246,7 @@ func main() {
 
 	server := NewServer()
 
+	// health and metrics
 	e.GET("/status", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, echo.Map{
 			"status":      "ok",
@@ -242,51 +254,44 @@ func main() {
 			"rooms_count": server.RoomsCount(),
 		})
 	})
-
 	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 
+	// websocket endpoint
 	e.GET("/ws", func(c echo.Context) error {
 		uid := c.QueryParam("user_uuid")
 		pid := c.QueryParam("project_uuid")
 		if uid == "" || pid == "" {
-			slog.Error("missing query params", "user_uuid", uid, "project_uuid", pid)
 			return echo.NewHTTPError(http.StatusBadRequest, "user_uuid and project_uuid required")
 		}
 
-		authHeader := c.Request().Header.Get("Authorization")
-		if authHeader == "" {
-			if protoHdr := c.Request().Header.Get("Sec-WebSocket-Protocol"); protoHdr != "" {
-				parts := strings.Split(protoHdr, ",")
+		auth := c.Request().Header.Get("Authorization")
+		if auth == "" {
+			if proto := c.Request().Header.Get("Sec-WebSocket-Protocol"); proto != "" {
+				parts := strings.Split(proto, ",")
 				if len(parts) == 2 && strings.TrimSpace(parts[0]) == "Bearer" {
-					authHeader = "Bearer " + strings.TrimSpace(parts[1])
+					auth = "Bearer " + strings.TrimSpace(parts[1])
 				}
 			}
 		}
-		if authHeader == "" {
-			slog.Error("authorization missing")
-			return echo.NewHTTPError(http.StatusBadRequest, "Authorization required (header or sub-protocol)")
+		if auth == "" {
+			return echo.NewHTTPError(http.StatusBadRequest, "Authorization required")
 		}
-
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-			slog.Error("invalid authorization format", "header", authHeader)
+		parts := strings.SplitN(auth, " ", 2)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
 			return echo.NewHTTPError(http.StatusBadRequest, "Authorization format must be Bearer {token}")
 		}
 
-		tokenString := parts[1]
-		validatedUUID, err := verifySupabaseToken(tokenString)
+		sub, err := verifySupabaseToken(parts[1])
 		if err != nil {
-			slog.Error("token verification failed", "error", err.Error())
-			return echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
+			return echo.NewHTTPError(http.StatusUnauthorized, err.Error())
 		}
-		if validatedUUID != uid {
-			slog.Error("token user mismatch", "token_user", validatedUUID, "request_user", uid)
+		if sub != uid {
 			return echo.NewHTTPError(http.StatusUnauthorized, "token user mismatch")
 		}
 
 		ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
 		if err != nil {
-			slog.Error("websocket upgrade failed", "error", err.Error(), "user", uid, "project", pid)
+			slog.Error("upgrade failed", "error", err.Error(), "user", uid, "project", pid)
 			return err
 		}
 
@@ -296,7 +301,7 @@ func main() {
 		for {
 			mt, msg, err := ws.ReadMessage()
 			if err != nil {
-				slog.Error("read message failed", "error", err.Error(), "user", uid, "project", pid)
+				slog.Error("read failed", "error", err.Error(), "user", uid, "project", pid)
 				break
 			}
 			server.Broadcast(pid, uid, mt, msg)
