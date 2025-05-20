@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,12 +28,11 @@ import (
 
 /*
 	───────────────────────────────
-	   ENVIRONMENT / GLOBAL VARS
+	      ENV & GLOBAL METRICS
 	───────────────────────────────
 */
 
 var (
-	/* prometheus */
 	usersCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "connected_users_total", Help: "Total websocket users ever connected",
 	})
@@ -39,53 +40,51 @@ var (
 		Name: "rooms_total", Help: "Total project rooms ever created",
 	})
 
-	/* Supabase */
-	supabaseURL     = strings.TrimRight(os.Getenv("SUPABASE_URL"), "/")
-	supabaseAnonKey = os.Getenv("SUPABASE_ANON_KEY")
+	supabaseURL        = strings.TrimRight(os.Getenv("SUPABASE_URL"), "/")
+	supabaseAnonKey    = os.Getenv("SUPABASE_ANON_KEY")
+	supabaseServiceKey = os.Getenv("SUPABASE_SERVICE_KEY")
 
-	/* JWKS cache singleton */
 	jwksCache *JWKSCache
 )
 
 /*
 	───────────────────────────────
-	   JWKS CACHE (singleton)
+	        JWKS CACHE
 	───────────────────────────────
 */
 
 type JWKSCache struct {
 	keys        map[string]jwk.Key
-	expiresAt   time.Time
+	expiry      time.Time
 	mu          sync.RWMutex
 	refreshLock sync.Mutex
 
-	jwksURL string
-	anonKey string
-	ttl     time.Duration
-	client  *http.Client
+	url   string
+	ttl   time.Duration
+	key   string
+	httpc *http.Client
 }
 
-func newJWKSCache(url, anon string, ttl time.Duration) *JWKSCache {
+func newJWKSCache(jwksURL, authKey string, ttl time.Duration) *JWKSCache {
 	return &JWKSCache{
-		keys:      map[string]jwk.Key{},
-		expiresAt: time.Now(), // force initial refresh
-		jwksURL:   url,
-		anonKey:   anon,
-		ttl:       ttl,
-		client:    &http.Client{Timeout: 10 * time.Second},
+		keys:   map[string]jwk.Key{},
+		expiry: time.Now(), // force initial fetch
+		url:    jwksURL,
+		key:    authKey,
+		ttl:    ttl,
+		httpc:  &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
 func (c *JWKSCache) GetKey(kid string) (jwk.Key, error) {
 	c.mu.RLock()
-	key, ok := c.keys[kid]
-	expired := time.Now().After(c.expiresAt)
+	key, found := c.keys[kid]
+	expired := time.Now().After(c.expiry)
 	c.mu.RUnlock()
 
-	if ok && !expired {
+	if found && !expired {
 		return key, nil
 	}
-
 	return c.refresh(kid)
 }
 
@@ -93,58 +92,59 @@ func (c *JWKSCache) refresh(targetKid string) (jwk.Key, error) {
 	c.refreshLock.Lock()
 	defer c.refreshLock.Unlock()
 
-	/* double-check after obtaining refresh lock */
+	/* check again after lock */
 	c.mu.RLock()
-	if !time.Now().After(c.expiresAt) {
-		key, ok := c.keys[targetKid]
+	if !time.Now().After(c.expiry) {
+		k, ok := c.keys[targetKid]
 		c.mu.RUnlock()
 		if ok {
-			return key, nil
+			return k, nil
 		}
-		c.mu.RUnlock()
 	}
 	c.mu.RUnlock()
 
-	req, err := http.NewRequest("GET", c.jwksURL, nil)
+	req, err := http.NewRequest("GET", c.url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("apikey", c.anonKey)
-	req.Header.Set("Authorization", "Bearer "+c.anonKey)
+	req.Header.Set("apikey", c.key)
+	req.Header.Set("Authorization", "Bearer "+c.key)
 
-	resp, err := c.client.Do(req)
+	resp, err := c.httpc.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("jwks http %d: %s", resp.StatusCode, b)
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("jwks http %d: %s", resp.StatusCode, body)
 	}
-
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
+
 	set, err := jwk.Parse(raw)
 	if err != nil {
 		return nil, err
 	}
 
-	newKeys := make(map[string]jwk.Key)
+	tmp := make(map[string]jwk.Key)
 	var found jwk.Key
-	it := set.Keys(context.Background())
-	for it.Next(context.Background()) {
-		k := it.Pair().Value.(jwk.Key)
-		newKeys[k.KeyID()] = k
+	for it := set.Keys(context.Background()); it.Next(context.Background()); {
+		pair := it.Pair()
+		k := pair.Value.(jwk.Key)
+		if k.KeyID() == "" {
+			continue
+		}
+		tmp[k.KeyID()] = k
 		if k.KeyID() == targetKid {
 			found = k
 		}
 	}
-
 	c.mu.Lock()
-	c.keys = newKeys
-	c.expiresAt = time.Now().Add(c.ttl)
+	c.keys = tmp
+	c.expiry = time.Now().Add(c.ttl)
 	c.mu.Unlock()
 
 	return found, nil
@@ -152,46 +152,47 @@ func (c *JWKSCache) refresh(targetKid string) (jwk.Key, error) {
 
 /*
 	───────────────────────────────
-	   JWT VALIDATION HELPERS
+	       JWT VALIDATION
 	───────────────────────────────
 */
 
-func extractKidAlg(token string) (kid, alg string, err error) {
-	parts := strings.Split(token, ".")
+func extractHeaderKidAlg(tok string) (kid, alg string, err error) {
+	parts := strings.Split(tok, ".")
 	if len(parts) != 3 {
-		return "", "", errors.New("token parts != 3")
+		return "", "", errors.New("token must have 3 parts")
 	}
-	hdr, err := base64.RawURLEncoding.DecodeString(parts[0])
+	hdrRaw, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
 		return "", "", err
 	}
-	var m map[string]any
-	if err := json.Unmarshal(hdr, &m); err != nil {
+	var hdr map[string]any
+	if err := json.Unmarshal(hdrRaw, &hdr); err != nil {
 		return "", "", err
 	}
-	if v, ok := m["kid"].(string); ok {
+	if v, ok := hdr["kid"].(string); ok {
 		kid = v
 	}
-	if v, ok := m["alg"].(string); ok {
+	if v, ok := hdr["alg"].(string); ok {
 		alg = v
 	}
 	return
 }
 
-func verifyToken(tokenStr string) (string, error) {
-	kid, alg, err := extractKidAlg(tokenStr)
+func validateToken(tokenStr string) (string, error) {
+	kid, hdrAlg, err := extractHeaderKidAlg(tokenStr)
 	if err != nil {
-		return "", fmt.Errorf("header parse: %w", err)
+		return "", err
 	}
 	if kid == "" {
-		return "", errors.New("kid missing in header")
+		return "", errors.New("kid missing")
 	}
+
 	key, err := jwksCache.GetKey(kid)
 	if err != nil {
 		return "", err
 	}
 
-	parsed, err := jwt.Parse([]byte(tokenStr),
+	tok, err := jwt.Parse([]byte(tokenStr),
 		jwt.WithKey(key.Algorithm(), key),
 		jwt.WithValidate(true),
 	)
@@ -202,12 +203,11 @@ func verifyToken(tokenStr string) (string, error) {
 		return "", fmt.Errorf("token invalid: %w", err)
 	}
 
-	/* optional alg mismatch warn */
-	if alg != "" && alg != key.Algorithm().String() {
-		slog.Warn("alg mismatch", "header_alg", alg, "key_alg", key.Algorithm(), "kid", kid)
+	if hdrAlg != "" && hdrAlg != key.Algorithm().String() && key.Algorithm() != jwa.NoSignature {
+		slog.Warn("alg header mismatch", "kid", kid, "hdr_alg", hdrAlg, "key_alg", key.Algorithm())
 	}
 
-	sub := parsed.Subject()
+	sub := tok.Subject()
 	if sub == "" {
 		return "", errors.New("subject claim missing")
 	}
@@ -216,15 +216,15 @@ func verifyToken(tokenStr string) (string, error) {
 
 /*
 	───────────────────────────────
-	    WEBSOCKET SERVER MODEL
+	      WEBSOCKET SERVER
 	───────────────────────────────
 */
 
 type Client struct {
-	conn        *websocket.Conn
-	userUUID    string
-	projectUUID string
-	mu          sync.Mutex
+	conn      *websocket.Conn
+	userID    string
+	projectID string
+	mu        sync.Mutex
 }
 
 type ProjectRoom struct {
@@ -245,8 +245,8 @@ func NewServer() *Server {
 }
 
 func (s *Server) gc() {
-	t := time.NewTicker(time.Minute)
-	for range t.C {
+	tk := time.NewTicker(time.Minute)
+	for range tk.C {
 		cut := time.Now().Add(-15 * time.Minute)
 		s.mu.Lock()
 		for id, room := range s.rooms {
@@ -274,7 +274,7 @@ func (s *Server) room(pid string) *ProjectRoom {
 
 func (s *Server) add(pid, uid string, ws *websocket.Conn) *Client {
 	r := s.room(pid)
-	c := &Client{conn: ws, userUUID: uid, projectUUID: pid}
+	c := &Client{conn: ws, userID: uid, projectID: pid}
 	r.mu.Lock()
 	r.clients[uid] = c
 	r.lastActivity = time.Now()
@@ -285,13 +285,13 @@ func (s *Server) add(pid, uid string, ws *websocket.Conn) *Client {
 
 func (s *Server) remove(c *Client) {
 	s.mu.RLock()
-	r, ok := s.rooms[c.projectUUID]
+	r, ok := s.rooms[c.projectID]
 	s.mu.RUnlock()
 	if !ok {
 		return
 	}
 	r.mu.Lock()
-	delete(r.clients, c.userUUID)
+	delete(r.clients, c.userID)
 	r.lastActivity = time.Now()
 	r.mu.Unlock()
 	c.conn.Close()
@@ -322,38 +322,40 @@ func (s *Server) broadcast(pid, sender string, mt int, msg []byte) {
 
 /*
 	───────────────────────────────
-	      APPLICATION ENTRY
+	       APPLICATION MAIN
 	───────────────────────────────
 */
 
 func main() {
-	/* ─── sanity env ─── */
-	if supabaseURL == "" || supabaseAnonKey == "" {
-		slog.Error("SUPABASE_URL or SUPABASE_ANON_KEY missing")
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{AddSource: false})))
+
+	if supabaseURL == "" {
+		slog.Error("SUPABASE_URL not set")
+		os.Exit(1)
+	}
+	// choose key: service > anon
+	key := supabaseServiceKey
+	if key == "" {
+		key = supabaseAnonKey
+	}
+	if key == "" {
+		slog.Error("SUPABASE_ANON_KEY or SUPABASE_SERVICE_KEY must be set")
 		os.Exit(1)
 	}
 
-	/* ─── JWKS cache ─── */
-	jwksCache = newJWKSCache(
-		fmt.Sprintf("%s/auth/v1/jwks", supabaseURL),
-		supabaseAnonKey,
-		15*time.Minute,
-	)
+	jwksURL := fmt.Sprintf("%s/auth/v1/keys?apikey=%s", supabaseURL, url.QueryEscape(key))
+	jwksCache = newJWKSCache(jwksURL, key, 15*time.Minute)
 
-	/* ─── prometheus ─── */
 	prometheus.MustRegister(usersCounter, roomsCounter)
 
-	/* ─── echo setup ─── */
 	e := echo.New()
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
 
-	srv := NewServer()
+	server := NewServer()
 
 	e.GET("/status", func(c echo.Context) error {
-		return c.JSON(http.StatusOK, echo.Map{
-			"status": "ok",
-		})
+		return c.String(http.StatusOK, "ok")
 	})
 	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 
@@ -371,26 +373,27 @@ func main() {
 
 		auth := c.Request().Header.Get("Authorization")
 		if auth == "" {
-			if p := c.Request().Header.Get("Sec-WebSocket-Protocol"); p != "" {
-				if parts := strings.Split(p, ","); len(parts) == 2 && strings.TrimSpace(parts[0]) == "Bearer" {
+			if proto := c.Request().Header.Get("Sec-WebSocket-Protocol"); proto != "" {
+				parts := strings.Split(proto, ",")
+				if len(parts) == 2 && strings.TrimSpace(parts[0]) == "Bearer" {
 					auth = "Bearer " + strings.TrimSpace(parts[1])
 				}
 			}
 		}
 		if auth == "" {
-			return echo.NewHTTPError(http.StatusBadRequest, "authorization missing")
+			return echo.NewHTTPError(http.StatusBadRequest, "Authorization required")
 		}
-		parts := strings.SplitN(auth, " ", 2)
-		if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
-			return echo.NewHTTPError(http.StatusBadRequest, "bad auth format")
+		p := strings.SplitN(auth, " ", 2)
+		if len(p) != 2 || !strings.EqualFold(p[0], "bearer") {
+			return echo.NewHTTPError(http.StatusBadRequest, "Auth format: Bearer <token>")
 		}
 
-		sub, err := verifyToken(parts[1])
+		sub, err := validateToken(p[1])
 		if err != nil {
 			return echo.NewHTTPError(http.StatusUnauthorized, err.Error())
 		}
 		if sub != uid {
-			return echo.NewHTTPError(http.StatusUnauthorized, "token/uid mismatch")
+			return echo.NewHTTPError(http.StatusUnauthorized, "token/user mismatch")
 		}
 
 		ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
@@ -398,15 +401,15 @@ func main() {
 			return err
 		}
 
-		cl := srv.add(pid, uid, ws)
-		defer srv.remove(cl)
+		client := server.add(pid, uid, ws)
+		defer server.remove(client)
 
 		for {
 			mt, msg, err := ws.ReadMessage()
 			if err != nil {
 				break
 			}
-			srv.broadcast(pid, uid, mt, msg)
+			server.broadcast(pid, uid, mt, msg)
 		}
 		return nil
 	})
