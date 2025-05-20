@@ -28,7 +28,7 @@ import (
 
 /*
 	───────────────────────────────
-	      ENV & GLOBAL METRICS
+	        METRICS + ENV
 	───────────────────────────────
 */
 
@@ -49,7 +49,7 @@ var (
 
 /*
 	───────────────────────────────
-	        JWKS CACHE
+	         JWKS CACHE
 	───────────────────────────────
 */
 
@@ -60,17 +60,17 @@ type JWKSCache struct {
 	refreshLock sync.Mutex
 
 	url   string
-	ttl   time.Duration
 	key   string
+	ttl   time.Duration
 	httpc *http.Client
 }
 
-func newJWKSCache(jwksURL, authKey string, ttl time.Duration) *JWKSCache {
+func newJWKSCache(jwksURL, key string, ttl time.Duration) *JWKSCache {
 	return &JWKSCache{
 		keys:   map[string]jwk.Key{},
-		expiry: time.Now(), // force initial fetch
+		expiry: time.Now(), // force first refresh
 		url:    jwksURL,
-		key:    authKey,
+		key:    key,
 		ttl:    ttl,
 		httpc:  &http.Client{Timeout: 10 * time.Second},
 	}
@@ -78,11 +78,12 @@ func newJWKSCache(jwksURL, authKey string, ttl time.Duration) *JWKSCache {
 
 func (c *JWKSCache) GetKey(kid string) (jwk.Key, error) {
 	c.mu.RLock()
-	key, found := c.keys[kid]
+	key, ok := c.keys[kid]
 	expired := time.Now().After(c.expiry)
 	c.mu.RUnlock()
 
-	if found && !expired {
+	if ok && !expired {
+		slog.Debug("JWKS cache hit", "kid", kid)
 		return key, nil
 	}
 	return c.refresh(kid)
@@ -92,16 +93,17 @@ func (c *JWKSCache) refresh(targetKid string) (jwk.Key, error) {
 	c.refreshLock.Lock()
 	defer c.refreshLock.Unlock()
 
-	/* check again after lock */
+	// another goroutine may already have refreshed
 	c.mu.RLock()
 	if !time.Now().After(c.expiry) {
-		k, ok := c.keys[targetKid]
-		c.mu.RUnlock()
-		if ok {
+		if k, ok := c.keys[targetKid]; ok {
+			c.mu.RUnlock()
 			return k, nil
 		}
 	}
 	c.mu.RUnlock()
+
+	slog.Info("Refreshing JWKS", "url", c.url, "target_kid", targetKid)
 
 	req, err := http.NewRequest("GET", c.url, nil)
 	if err != nil {
@@ -112,28 +114,32 @@ func (c *JWKSCache) refresh(targetKid string) (jwk.Key, error) {
 
 	resp, err := c.httpc.Do(req)
 	if err != nil {
+		slog.Error("JWKS HTTP request failed", "error", err.Error())
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("jwks http %d: %s", resp.StatusCode, body)
+		b, _ := io.ReadAll(resp.Body)
+		slog.Error("JWKS endpoint returned non-200", "status", resp.StatusCode, "body", string(b))
+		return nil, fmt.Errorf("jwks http %d: %s", resp.StatusCode, b)
 	}
-	raw, err := io.ReadAll(resp.Body)
+
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	set, err := jwk.Parse(raw)
+	set, err := jwk.Parse(body)
 	if err != nil {
+		slog.Error("Failed to parse JWKS", "error", err.Error())
 		return nil, err
 	}
 
 	tmp := make(map[string]jwk.Key)
 	var found jwk.Key
 	for it := set.Keys(context.Background()); it.Next(context.Background()); {
-		pair := it.Pair()
-		k := pair.Value.(jwk.Key)
+		k := it.Pair().Value.(jwk.Key)
 		if k.KeyID() == "" {
 			continue
 		}
@@ -142,44 +148,50 @@ func (c *JWKSCache) refresh(targetKid string) (jwk.Key, error) {
 			found = k
 		}
 	}
+
 	c.mu.Lock()
 	c.keys = tmp
 	c.expiry = time.Now().Add(c.ttl)
 	c.mu.Unlock()
 
+	slog.Info("JWKS refreshed", "keys_cached", len(tmp))
+
+	if found == nil && targetKid != "" {
+		slog.Warn("JWKS refreshed but key not found", "kid", targetKid)
+	}
 	return found, nil
 }
 
 /*
 	───────────────────────────────
-	       JWT VALIDATION
+	        TOKEN VALIDATION
 	───────────────────────────────
 */
 
-func extractHeaderKidAlg(tok string) (kid, alg string, err error) {
-	parts := strings.Split(tok, ".")
-	if len(parts) != 3 {
-		return "", "", errors.New("token must have 3 parts")
+func headerKidAlg(tok string) (kid, alg string, err error) {
+	p := strings.Split(tok, ".")
+	if len(p) != 3 {
+		return "", "", errors.New("token malformed")
 	}
-	hdrRaw, err := base64.RawURLEncoding.DecodeString(parts[0])
+	hRaw, err := base64.RawURLEncoding.DecodeString(p[0])
 	if err != nil {
 		return "", "", err
 	}
-	var hdr map[string]any
-	if err := json.Unmarshal(hdrRaw, &hdr); err != nil {
+	var h map[string]any
+	if err := json.Unmarshal(hRaw, &h); err != nil {
 		return "", "", err
 	}
-	if v, ok := hdr["kid"].(string); ok {
+	if v, ok := h["kid"].(string); ok {
 		kid = v
 	}
-	if v, ok := hdr["alg"].(string); ok {
+	if v, ok := h["alg"].(string); ok {
 		alg = v
 	}
 	return
 }
 
-func validateToken(tokenStr string) (string, error) {
-	kid, hdrAlg, err := extractHeaderKidAlg(tokenStr)
+func validateToken(tok string) (string, error) {
+	kid, hdrAlg, err := headerKidAlg(tok)
 	if err != nil {
 		return "", err
 	}
@@ -192,31 +204,31 @@ func validateToken(tokenStr string) (string, error) {
 		return "", err
 	}
 
-	tok, err := jwt.Parse([]byte(tokenStr),
-		jwt.WithKey(key.Algorithm(), key),
-		jwt.WithValidate(true),
-	)
+	parsed, err := jwt.Parse([]byte(tok), jwt.WithKey(key.Algorithm(), key), jwt.WithValidate(true))
 	if err != nil {
 		if errors.Is(err, jwt.ErrTokenExpired()) {
+			slog.Warn("Token expired", "kid", kid)
 			return "", fmt.Errorf("token expired: %w", err)
 		}
 		return "", fmt.Errorf("token invalid: %w", err)
 	}
 
 	if hdrAlg != "" && hdrAlg != key.Algorithm().String() && key.Algorithm() != jwa.NoSignature {
-		slog.Warn("alg header mismatch", "kid", kid, "hdr_alg", hdrAlg, "key_alg", key.Algorithm())
+		slog.Warn("alg mismatch", "kid", kid, "hdr_alg", hdrAlg, "key_alg", key.Algorithm())
 	}
 
-	sub := tok.Subject()
+	sub := parsed.Subject()
 	if sub == "" {
 		return "", errors.New("subject claim missing")
 	}
+
+	slog.Debug("Token validated", "kid", kid, "sub", sub)
 	return sub, nil
 }
 
 /*
 	───────────────────────────────
-	      WEBSOCKET SERVER
+	       SERVER STRUCTURES
 	───────────────────────────────
 */
 
@@ -249,12 +261,13 @@ func (s *Server) gc() {
 	for range tk.C {
 		cut := time.Now().Add(-15 * time.Minute)
 		s.mu.Lock()
-		for id, room := range s.rooms {
-			room.mu.RLock()
-			if room.lastActivity.Before(cut) {
+		for id, r := range s.rooms {
+			r.mu.RLock()
+			if r.lastActivity.Before(cut) {
 				delete(s.rooms, id)
+				slog.Info("room GC", "project", id)
 			}
-			room.mu.RUnlock()
+			r.mu.RUnlock()
 		}
 		s.mu.Unlock()
 	}
@@ -269,18 +282,20 @@ func (s *Server) room(pid string) *ProjectRoom {
 	r := &ProjectRoom{clients: map[string]*Client{}, lastActivity: time.Now()}
 	s.rooms[pid] = r
 	roomsCounter.Inc()
+	slog.Info("created room", "project", pid)
 	return r
 }
 
 func (s *Server) add(pid, uid string, ws *websocket.Conn) *Client {
 	r := s.room(pid)
-	c := &Client{conn: ws, userID: uid, projectID: pid}
+	cl := &Client{conn: ws, userID: uid, projectID: pid}
 	r.mu.Lock()
-	r.clients[uid] = c
+	r.clients[uid] = cl
 	r.lastActivity = time.Now()
 	r.mu.Unlock()
 	usersCounter.Inc()
-	return c
+	slog.Info("added client", "user", uid, "project", pid)
+	return cl
 }
 
 func (s *Server) remove(c *Client) {
@@ -295,6 +310,7 @@ func (s *Server) remove(c *Client) {
 	r.lastActivity = time.Now()
 	r.mu.Unlock()
 	c.conn.Close()
+	slog.Info("removed client", "user", c.userID, "project", c.projectID)
 }
 
 func (s *Server) broadcast(pid, sender string, mt int, msg []byte) {
@@ -302,51 +318,64 @@ func (s *Server) broadcast(pid, sender string, mt int, msg []byte) {
 	r, ok := s.rooms[pid]
 	s.mu.RUnlock()
 	if !ok {
+		slog.Warn("broadcast to non-existing room", "project", pid)
 		return
 	}
 	r.mu.RLock()
-	targets := make([]*Client, 0, len(r.clients))
-	for id, cl := range r.clients {
-		if id != sender {
-			targets = append(targets, cl)
-		}
-	}
+	targetCount := len(r.clients) - 1
 	r.mu.RUnlock()
 
-	for _, cl := range targets {
+	if targetCount <= 0 {
+		slog.Debug("no targets to broadcast", "project", pid)
+		return
+	}
+
+	slog.Debug("broadcast", "project", pid, "from", sender, "targets", targetCount)
+
+	r.mu.RLock()
+	for id, cl := range r.clients {
+		if id == sender {
+			continue
+		}
 		cl.mu.Lock()
-		_ = cl.conn.WriteMessage(mt, msg)
+		if err := cl.conn.WriteMessage(mt, msg); err != nil {
+			slog.Error("broadcast write failed", "error", err.Error(), "to_user", cl.userID, "project", pid)
+		}
 		cl.mu.Unlock()
 	}
+	r.mu.RUnlock()
 }
 
 /*
 	───────────────────────────────
-	       APPLICATION MAIN
+	         APPLICATION MAIN
 	───────────────────────────────
 */
 
-func main() {
+func init() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{AddSource: false})))
 
 	if supabaseURL == "" {
 		slog.Error("SUPABASE_URL not set")
-		os.Exit(1)
 	}
-	// choose key: service > anon
-	key := supabaseServiceKey
-	if key == "" {
-		key = supabaseAnonKey
+	if supabaseAnonKey == "" && supabaseServiceKey == "" {
+		slog.Error("No Supabase key available – JWKS fetch will fail")
+	} else {
+		slog.Info("Supabase env OK", "url", supabaseURL)
 	}
-	if key == "" {
-		slog.Error("SUPABASE_ANON_KEY or SUPABASE_SERVICE_KEY must be set")
-		os.Exit(1)
-	}
-
-	jwksURL := fmt.Sprintf("%s/auth/v1/keys?apikey=%s", supabaseURL, url.QueryEscape(key))
-	jwksCache = newJWKSCache(jwksURL, key, 15*time.Minute)
 
 	prometheus.MustRegister(usersCounter, roomsCounter)
+}
+
+func main() {
+	/* JWKS cache */
+	apiKey := supabaseServiceKey
+	if apiKey == "" {
+		apiKey = supabaseAnonKey
+	}
+
+	jwksURL := fmt.Sprintf("%s/auth/v1/keys?apikey=%s", supabaseURL, url.QueryEscape(apiKey))
+	jwksCache = newJWKSCache(jwksURL, apiKey, 15*time.Minute)
 
 	e := echo.New()
 	e.Use(middleware.Logger())
@@ -354,9 +383,7 @@ func main() {
 
 	server := NewServer()
 
-	e.GET("/status", func(c echo.Context) error {
-		return c.String(http.StatusOK, "ok")
-	})
+	e.GET("/status", func(c echo.Context) error { return c.String(http.StatusOK, "ok") })
 	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 
 	upgrader := websocket.Upgrader{
@@ -368,45 +395,52 @@ func main() {
 		uid := c.QueryParam("user_uuid")
 		pid := c.QueryParam("project_uuid")
 		if uid == "" || pid == "" {
-			return echo.NewHTTPError(http.StatusBadRequest, "user_uuid & project_uuid required")
+			slog.Error("missing query params", "uid", uid, "pid", pid)
+			return echo.NewHTTPError(http.StatusBadRequest, "user_uuid and project_uuid required")
 		}
 
 		auth := c.Request().Header.Get("Authorization")
 		if auth == "" {
 			if proto := c.Request().Header.Get("Sec-WebSocket-Protocol"); proto != "" {
-				parts := strings.Split(proto, ",")
-				if len(parts) == 2 && strings.TrimSpace(parts[0]) == "Bearer" {
+				if parts := strings.Split(proto, ","); len(parts) == 2 && strings.TrimSpace(parts[0]) == "Bearer" {
 					auth = "Bearer " + strings.TrimSpace(parts[1])
 				}
 			}
 		}
 		if auth == "" {
+			slog.Warn("authorization header missing")
 			return echo.NewHTTPError(http.StatusBadRequest, "Authorization required")
 		}
-		p := strings.SplitN(auth, " ", 2)
-		if len(p) != 2 || !strings.EqualFold(p[0], "bearer") {
-			return echo.NewHTTPError(http.StatusBadRequest, "Auth format: Bearer <token>")
+		parts := strings.SplitN(auth, " ", 2)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
+			slog.Warn("invalid auth header", "header", auth)
+			return echo.NewHTTPError(http.StatusBadRequest, "Authorization format must be Bearer {token}")
 		}
 
-		sub, err := validateToken(p[1])
+		sub, err := validateToken(parts[1])
 		if err != nil {
+			slog.Warn("token validation error", "error", err.Error())
 			return echo.NewHTTPError(http.StatusUnauthorized, err.Error())
 		}
 		if sub != uid {
-			return echo.NewHTTPError(http.StatusUnauthorized, "token/user mismatch")
+			slog.Warn("token user mismatch", "token_sub", sub, "uid", uid)
+			return echo.NewHTTPError(http.StatusUnauthorized, "token user mismatch")
 		}
 
 		ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
 		if err != nil {
+			slog.Error("websocket upgrade failed", "error", err.Error(), "uid", uid, "pid", pid)
 			return err
 		}
+		slog.Info("websocket connected", "uid", uid, "pid", pid)
 
-		client := server.add(pid, uid, ws)
-		defer server.remove(client)
+		cl := server.add(pid, uid, ws)
+		defer server.remove(cl)
 
 		for {
 			mt, msg, err := ws.ReadMessage()
 			if err != nil {
+				slog.Warn("read fail", "error", err.Error(), "uid", uid)
 				break
 			}
 			server.broadcast(pid, uid, mt, msg)
@@ -415,6 +449,7 @@ func main() {
 	})
 
 	if err := e.Start(":8989"); err != nil {
-		slog.Error("echo start", "error", err)
+		slog.Error("server start failed", "error", err.Error())
+		os.Exit(1)
 	}
 }
