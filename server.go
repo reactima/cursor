@@ -18,16 +18,36 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+type Client struct {
+	conn      *websocket.Conn
+	userID    string
+	projectID string
+	mu        sync.Mutex
+}
+
+type ProjectRoom struct {
+	clients      map[*Client]struct{}
+	mu           sync.RWMutex
+	lastActivity time.Time
+}
+
+type Server struct {
+	rooms map[string]*ProjectRoom
+	mu    sync.RWMutex
+}
+
 var (
 	usersCounter = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "connected_users_total", Help: "Total websocket users ever connected",
+		Name: "connected_users_total",
+		Help: "Total websocket connections ever established",
 	})
 	roomsCounter = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "rooms_total", Help: "Total project rooms ever created",
+		Name: "rooms_total",
+		Help: "Total project rooms ever created",
 	})
 
-	supabaseURL        = strings.TrimRight(os.Getenv("SUPABASE_URL"), "/")
-	supabaseServiceKey = os.Getenv("SUPABASE_SERVICE_KEY")
+	supabaseURL     = strings.TrimRight(os.Getenv("SUPABASE_URL"), "/")
+	supabaseAnonKey = os.Getenv("SUPABASE_ANON_KEY")
 )
 
 func init() {
@@ -37,16 +57,15 @@ func init() {
 	if supabaseURL == "" {
 		slog.Error("SUPABASE_URL is not set")
 	}
-	if supabaseServiceKey == "" {
-		slog.Error("SUPABASE_SERVICE_KEY is not set; admin-verify will fail")
+	if supabaseAnonKey == "" {
+		slog.Error("SUPABASE_ANON_KEY is not set; admin-verify will fail")
 	} else {
 		slog.Info("Loaded Supabase service key")
 	}
 	prometheus.MustRegister(usersCounter, roomsCounter)
 }
 
-// verifyViaAdmin asks Supabase to validate the user's JWT.
-// GET /auth/v1/user returning the user object directly.
+// verifyViaAdmin validates the user's JWT with Supabase.
 func verifyViaAdmin(userJWT string) (string, error) {
 	endpoint := fmt.Sprintf("%s/auth/v1/user", supabaseURL)
 	req, err := http.NewRequest("GET", endpoint, nil)
@@ -54,7 +73,7 @@ func verifyViaAdmin(userJWT string) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+userJWT)
-	req.Header.Set("apikey", supabaseServiceKey)
+	req.Header.Set("apikey", supabaseAnonKey)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -80,26 +99,8 @@ func verifyViaAdmin(userJWT string) (string, error) {
 		slog.Warn("admin-verify missing id claim", "body", string(body))
 		return "", fmt.Errorf("admin-verify missing user.id")
 	}
-	slog.Warn("admin-verify success", "id", user.ID)
+	slog.Info("admin-verify success", "id", user.ID)
 	return user.ID, nil
-}
-
-type Client struct {
-	conn        *websocket.Conn
-	userUUID    string
-	projectUUID string
-	mu          sync.Mutex
-}
-
-type ProjectRoom struct {
-	clients      map[string]*Client
-	mu           sync.RWMutex
-	lastActivity time.Time
-}
-
-type Server struct {
-	rooms map[string]*ProjectRoom
-	mu    sync.RWMutex
 }
 
 func NewServer() *Server {
@@ -115,76 +116,96 @@ func (s *Server) runCleanup() {
 		cutoff := time.Now().Add(-15 * time.Minute)
 		s.mu.Lock()
 		for pid, room := range s.rooms {
-			room.mu.RLock()
+			room.mu.Lock()
 			if room.lastActivity.Before(cutoff) {
+				// close all client connections before purging the room
+				// so they receive a close frame
+				// "reconnect-websocket" might try to reconnect on frontend though
+				for client := range room.clients {
+					_ = client.conn.WriteMessage(websocket.CloseMessage,
+						websocket.FormatCloseMessage(websocket.CloseNormalClosure,
+							"room idle for 15m, reconnect"))
+					client.conn.Close()
+					delete(room.clients, client)
+				}
+				room.mu.Unlock() // unlock before deleting from map
 				delete(s.rooms, pid)
 				slog.Info("cleaned up room", "project", pid)
+				continue
 			}
-			room.mu.RUnlock()
+			room.mu.Unlock()
 		}
 		s.mu.Unlock()
 	}
 }
 
-func (s *Server) getOrCreateRoom(pid string) *ProjectRoom {
+func (s *Server) getOrCreateRoom(projectID string) *ProjectRoom {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	room, ok := s.rooms[pid]
+	room, ok := s.rooms[projectID]
 	if !ok {
-		room = &ProjectRoom{clients: make(map[string]*Client), lastActivity: time.Now()}
-		s.rooms[pid] = room
+		room = &ProjectRoom{
+			clients:      make(map[*Client]struct{}),
+			lastActivity: time.Now(),
+		}
+		s.rooms[projectID] = room
 		roomsCounter.Inc()
-		slog.Info("created new room", "project", pid)
+		slog.Info("created new room", "project", projectID)
 	}
 	return room
 }
 
-func (s *Server) AddClient(pid, uid string, ws *websocket.Conn) *Client {
-	room := s.getOrCreateRoom(pid)
-	client := &Client{conn: ws, userUUID: uid, projectUUID: pid}
+func (s *Server) AddClient(projectID, userID string, ws *websocket.Conn) *Client {
+	room := s.getOrCreateRoom(projectID)
+	client := &Client{conn: ws, userID: userID, projectID: projectID}
+
 	room.mu.Lock()
-	room.clients[uid] = client
+	room.clients[client] = struct{}{}
 	room.lastActivity = time.Now()
 	room.mu.Unlock()
+
 	usersCounter.Inc()
-	slog.Info("added client", "user", uid, "project", pid)
+	slog.Info("added client", "user", userID, "project", projectID)
 	return client
 }
 
 func (s *Server) RemoveClient(c *Client) {
 	s.mu.RLock()
-	room, ok := s.rooms[c.projectUUID]
+	room, ok := s.rooms[c.projectID]
 	s.mu.RUnlock()
 	if !ok {
 		return
 	}
 	room.mu.Lock()
-	delete(room.clients, c.userUUID)
+	delete(room.clients, c)
 	room.lastActivity = time.Now()
 	room.mu.Unlock()
+
 	c.conn.Close()
-	slog.Info("removed client", "user", c.userUUID, "project", c.projectUUID)
+	slog.Info("removed client", "user", c.userID, "project", c.projectID)
 }
 
-func (s *Server) Broadcast(pid, sender string, mt int, msg []byte) {
+func (s *Server) Broadcast(projectID string, sender *Client, mt int, msg []byte) {
 	s.mu.RLock()
-	room, ok := s.rooms[pid]
+	room, ok := s.rooms[projectID]
 	s.mu.RUnlock()
 	if !ok {
 		return
 	}
+
 	room.mu.RLock()
-	for uid, client := range room.clients {
-		if uid == sender {
+	for client := range room.clients {
+		if client == sender {
 			continue
 		}
 		client.mu.Lock()
 		if err := client.conn.WriteMessage(mt, msg); err != nil {
-			slog.Error("broadcast write failed", "err", err.Error(), "to", uid)
+			slog.Error("broadcast write failed", "err", err.Error(), "to", client.userID)
 		}
 		client.mu.Unlock()
 	}
 	room.mu.RUnlock()
+
 	room.mu.Lock()
 	room.lastActivity = time.Now()
 	room.mu.Unlock()
@@ -217,9 +238,22 @@ func main() {
 	e := echo.New()
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
+	e.Pre(middleware.Rewrite(map[string]string{
+		"/collab/*": "/$1",
+		"/collab":   "/",
+	}))
 
 	server := NewServer()
 
+	// Health check endpoint
+	e.GET("/", func(c echo.Context) error {
+		return c.JSON(http.StatusOK, echo.Map{
+			"status":  "ok",
+			"version": "0.0.4", // bumped version after idle-close change
+		})
+	})
+
+	// Easy to ready metrics endpoint
 	e.GET("/status", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, echo.Map{
 			"status":      "ok",
@@ -227,14 +261,16 @@ func main() {
 			"rooms_count": server.RoomsCount(),
 		})
 	})
+
+	// Scrapping endpoint for Prometheus
 	e.GET("/metrics", echo.WrapHandler(promhttp.Handler()))
 
 	e.GET("/ws", func(c echo.Context) error {
-		uid := c.QueryParam("user_uuid")
-		pid := c.QueryParam("project_uuid")
-		if uid == "" || pid == "" {
-			slog.Error("missing query params", "user_uuid", uid, "project_uuid", pid)
-			return echo.NewHTTPError(http.StatusBadRequest, "user_uuid and project_uuid required")
+		userID := c.QueryParam("user_id")
+		projectID := c.QueryParam("project_id")
+		if userID == "" || projectID == "" {
+			slog.Error("missing query params", "user_id", userID, "project_id", projectID)
+			return echo.NewHTTPError(http.StatusBadRequest, "user_id and project_id required")
 		}
 
 		auth := c.Request().Header.Get("Authorization")
@@ -255,15 +291,15 @@ func main() {
 			slog.Error("invalid authorization format", "header", auth)
 			return echo.NewHTTPError(http.StatusBadRequest, "Authorization must be Bearer {token}")
 		}
-		userJWT := parts[1]
 
+		userJWT := parts[1]
 		sub, err := verifyViaAdmin(userJWT)
 		if err != nil {
 			slog.Warn("token validation failed", "err", err.Error())
 			return echo.NewHTTPError(http.StatusUnauthorized, "invalid token")
 		}
-		if sub != uid {
-			slog.Error("token user mismatch", "token_sub", sub, "query_uid", uid)
+		if sub != userID {
+			slog.Error("token user mismatch", "token_sub", sub, "query_user_id", userID)
 			return echo.NewHTTPError(http.StatusUnauthorized, "token user mismatch")
 		}
 
@@ -272,7 +308,8 @@ func main() {
 			slog.Error("websocket upgrade failed", "err", err.Error())
 			return err
 		}
-		client := server.AddClient(pid, uid, ws)
+
+		client := server.AddClient(projectID, userID, ws)
 		defer server.RemoveClient(client)
 
 		for {
@@ -281,7 +318,7 @@ func main() {
 				slog.Error("read message failed", "err", err.Error())
 				break
 			}
-			server.Broadcast(pid, uid, mt, msg)
+			server.Broadcast(projectID, client, mt, msg)
 		}
 		return nil
 	})
