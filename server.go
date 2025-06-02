@@ -1,9 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -18,11 +18,25 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+const (
+	idleRoomTTL   = 15 * time.Minute
+	verifyTimeout = 15 * time.Second
+	writeTimeout  = 5 * time.Second
+)
+
 type Client struct {
 	conn      *websocket.Conn
 	userID    string
 	projectID string
 	mu        sync.Mutex
+}
+
+// thread-safe write with deadline
+func (c *Client) write(mt int, msg []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	return c.conn.WriteMessage(mt, msg)
 }
 
 type ProjectRoom struct {
@@ -67,8 +81,10 @@ func init() {
 
 // verifyViaAdmin validates the user's JWT with Supabase.
 func verifyViaAdmin(userJWT string) (string, error) {
-	endpoint := fmt.Sprintf("%s/auth/v1/user", supabaseURL)
-	req, err := http.NewRequest("GET", endpoint, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), verifyTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/auth/v1/user", supabaseURL), nil)
 	if err != nil {
 		return "", err
 	}
@@ -82,21 +98,20 @@ func verifyViaAdmin(userJWT string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		slog.Warn("admin-verify failed", "status", resp.StatusCode, "body", string(body))
+		slog.Warn("admin-verify failed", "status", resp.StatusCode) // body dropped
 		return "", fmt.Errorf("admin-verify failed: %d", resp.StatusCode)
 	}
 
 	var user struct {
 		ID string `json:"id"`
 	}
-	if err := json.Unmarshal(body, &user); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
 		slog.Error("admin-verify decode error", "err", err.Error())
 		return "", err
 	}
 	if user.ID == "" {
-		slog.Warn("admin-verify missing id claim", "body", string(body))
+		slog.Warn("admin-verify missing id claim")
 		return "", fmt.Errorf("admin-verify missing user.id")
 	}
 	slog.Info("admin-verify success", "id", user.ID)
@@ -112,30 +127,34 @@ func NewServer() *Server {
 func (s *Server) runCleanup() {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
+
 	for range ticker.C {
-		cutoff := time.Now().Add(-15 * time.Minute)
+		now := time.Now()
 		s.mu.Lock()
+		var stale []*ProjectRoom
 		for pid, room := range s.rooms {
-			room.mu.Lock()
-			if room.lastActivity.Before(cutoff) {
-				// close all client connections before purging the room
-				// so they receive a close frame
-				// "reconnect-websocket" might try to reconnect on frontend though
-				for client := range room.clients {
-					_ = client.conn.WriteMessage(websocket.CloseMessage,
-						websocket.FormatCloseMessage(websocket.CloseNormalClosure,
-							"room idle for 15m, reconnect"))
-					client.conn.Close()
-					delete(room.clients, client)
-				}
-				room.mu.Unlock() // unlock before deleting from map
+			room.mu.RLock()
+			idle := now.Sub(room.lastActivity) > idleRoomTTL
+			room.mu.RUnlock()
+			if idle {
+				stale = append(stale, room)
 				delete(s.rooms, pid)
 				slog.Info("cleaned up room", "project", pid)
-				continue
 			}
-			room.mu.Unlock()
 		}
 		s.mu.Unlock()
+
+		// close conns outside global lock
+		for _, room := range stale {
+			room.mu.RLock()
+			for c := range room.clients {
+				_ = c.write(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure,
+						"room idle, reconnect"))
+				_ = c.conn.Close()
+			}
+			room.mu.RUnlock()
+		}
 	}
 }
 
@@ -181,10 +200,12 @@ func (s *Server) RemoveClient(c *Client) {
 	room.lastActivity = time.Now()
 	room.mu.Unlock()
 
-	c.conn.Close()
+	_ = c.conn.Close()
+	c.conn = nil // help GC
 	slog.Info("removed client", "user", c.userID, "project", c.projectID)
 }
 
+// Broadcast avoids holding locks during network I/O
 func (s *Server) Broadcast(projectID string, sender *Client, mt int, msg []byte) {
 	s.mu.RLock()
 	room, ok := s.rooms[projectID]
@@ -193,18 +214,21 @@ func (s *Server) Broadcast(projectID string, sender *Client, mt int, msg []byte)
 		return
 	}
 
+	// snapshot clients
 	room.mu.RLock()
-	for client := range room.clients {
-		if client == sender {
-			continue
+	targets := make([]*Client, 0, len(room.clients))
+	for c := range room.clients {
+		if c != sender {
+			targets = append(targets, c)
 		}
-		client.mu.Lock()
-		if err := client.conn.WriteMessage(mt, msg); err != nil {
-			slog.Error("broadcast write failed", "err", err.Error(), "to", client.userID)
-		}
-		client.mu.Unlock()
 	}
 	room.mu.RUnlock()
+
+	for _, c := range targets {
+		if err := c.write(mt, msg); err != nil {
+			slog.Error("broadcast write failed", "err", err.Error(), "to", c.userID)
+		}
+	}
 
 	room.mu.Lock()
 	room.lastActivity = time.Now()
@@ -230,7 +254,7 @@ func (s *Server) RoomsCount() int {
 }
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin:  func(r *http.Request) bool { return true },
+	CheckOrigin:  func(r *http.Request) bool { return true }, // CORS ignored per requirement
 	Subprotocols: []string{"Bearer"},
 }
 
@@ -315,7 +339,9 @@ func main() {
 		for {
 			mt, msg, err := ws.ReadMessage()
 			if err != nil {
-				slog.Error("read message failed", "err", err.Error())
+				if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+					slog.Error("read message failed", "err", err.Error())
+				}
 				break
 			}
 			server.Broadcast(projectID, client, mt, msg)
